@@ -1,0 +1,16 @@
+[Unit]
+Description=Voice-controlled PC power listener for Bemfa Cloud
+After=network.target
+
+[Service]
+Type=simple
+# Runs as root: etherwake needs raw socket access, and ssh uses /root/.ssh/id_rsa
+User=root
+# Adjust to wherever you placed the script
+WorkingDirectory=/opt/pc-power
+ExecStart=/usr/bin/python3 /opt/pc-power/wol_listener.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
