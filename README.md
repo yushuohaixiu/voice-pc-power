@@ -21,10 +21,11 @@ The core idea is: *an always-on LAN host holds a private key that can log into y
 | **内网端口暴露** | 为了免密登入，目标 PC 要开 22 端口 | 只在局域网开放；路由器上**绝不要**做 22 端口映射到公网 |
 | **唤醒依赖硬件** | 网卡驱动、BIOS 的 ErP 设置、快速启动都会让魔术包失效 | 见下文"Windows 侧"一节的验收命令，装完必须逐条验证 |
 | **常开主机成为单点** | 跳板机一挂，开关机全部失效 | 用低功耗设备、开自动重启、定期检查服务状态 |
+| **子网路由放大风险** | 若跳板机同时做 Tailscale 子网路由（见附录 A），它就从"一个开关"变成"整个局域网的入口" | 开启 device approval、收窄 ACL、不共享节点 |
 
-> 如果你打算把这套东西放到公网（比如从公司关机），请**不要**直接暴露 SSH。改用 WireGuard / Tailscale 之类的隧道，并限制来源。
+> 如果你打算把这套东西放到公网（比如从公司关机），请**不要**直接暴露 SSH。改用 WireGuard / Tailscale 之类的隧道，并限制来源 —— 具体做法与随之而来的风险见 **附录 A**。
 >
-> If you plan to reach this from outside your LAN, do **not** expose SSH directly. Put it behind WireGuard / Tailscale and restrict sources.
+> If you plan to reach this from outside your LAN, do **not** expose SSH directly. Put it behind WireGuard / Tailscale and restrict sources — see **Appendix A**.
 
 ---
 
@@ -104,7 +105,7 @@ TARGET_USER  = "YourUser"      # 目标 PC 的 Windows 账户名
 TOPIC        = "pcpower001"
 ```
 
-> **最容易踩的坑**：跳板机的网卡名写错（例如写成 `eth0` 但实际是 `ens192`），`etherwake` 会直接报 `Device does not exist`，表现就是"开电脑没反应"。上线前先 `ip -br addr` 核对。
+> **最容易踩的坑**：跳板机的网卡名写错（例如照抄文档写成 `eth0`，但机器上实际叫 `enp3s0` 或 `ens18`），`etherwake` 会直接报 `Device does not exist`，表现就是"开电脑没反应"。上线前先 `ip -br addr` 核对。
 
 ### 2.3 systemd 单元 / Systemd unit
 
@@ -260,6 +261,7 @@ ssh -o PasswordAuthentication=no <TARGET_USER>@<TARGET_HOST> hostname
 - [ ] 需要从外网控制时，用 WireGuard / Tailscale 隧道，不暴露端口
 - [ ] 定期 `systemctl status wol-listener` 与 `journalctl` 巡检
 - [ ] 保留物理电源键，避免云端失效后无法开机
+- [ ] 若启用了子网路由（附录 A）：开启 device approval，ACL 收敛到"只有自己的设备能访问 22 端口"
 
 ---
 
@@ -274,3 +276,55 @@ MIT。欢迎 issue / PR 补充不同网卡与 BIOS 的差异细节。
 本方案涉及远程关机与免密登录，请仅在**你自己的设备与网络**上使用。因误操作、密钥泄露、配置不当导致的数据丢失或安全问题，由使用者自行承担。作者不对任何由此产生的损失负责。
 
 This project involves remote shutdown and passwordless login. Use it only on devices and networks you own. You are responsible for any data loss or security incident caused by misconfiguration or key leakage.
+
+---
+
+## 附录 A：从外网访问 — Tailscale 子网路由 / Remote access via Tailscale subnet router
+
+不必在局域网每台设备上都装客户端：让跳板机做 **subnet router** 即可。前提是跳板机本身常开 —— 这与本方案对跳板机的要求天然重合。
+
+Instead of installing a client on every LAN device, let the bridge host act as a **subnet router**. It must be always-on, which this design already requires anyway.
+
+### A.1 配置 / Setup
+
+```bash
+# 1. 开转发（Debian 12 默认关闭）
+echo 'net.ipv4.ip_forward=1'          | sudo tee /etc/sysctl.d/99-tailscale.conf
+echo 'net.ipv6.conf.all.forwarding=1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf
+sudo sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+# 2. 宣告局域网网段（把网段换成你自己的）
+sudo tailscale up --advertise-routes=192.168.1.0/24
+```
+
+随后在 Tailscale 管理后台 **Approve** 这条路由。外部设备连上 tailnet 后，直接访问 `192.168.1.x` 下的全部设备，无需单独安装客户端。
+
+### A.2 为什么外网也能"开电脑" / Why WOL still works remotely
+
+魔术包是**二层广播**，天生不能跨网段、跨隧道。外网的"开/关机"请求其实只是发到巴法云的一条消息，真正的 WOL 由**跳板机在局域网内代发**，关机也是跳板机主动 SSH 出去。
+
+因此链路是否可用，只取决于「跳板机在线 + 巴法云在线」，与你在不在局域网无关。**这也是监听服务必须放在跳板机上的原因** —— 装在别的设备上根本发不出包。
+
+A magic packet is a layer-2 broadcast and cannot cross subnets or tunnels. The voice command only travels to Bemfa Cloud; the actual WOL is emitted by the bridge host inside the LAN. That is why the listener must live on the bridge host.
+
+### A.3 风险升级（务必注意）/ Elevated risk
+
+启用子网路由后，跳板机从"一个开关"变成了"整个局域网的入口"。任何能进入你 tailnet 的设备 —— 被盗的账号、被误邀请的共享节点、家人的手机 —— 都等于站在你的内网里，并且可以直接 SSH 登入目标 PC（因为已经配了免密登录）。
+
+With subnet routing enabled, the bridge host stops being "a switch" and becomes "the entry to your entire LAN". Anyone who joins your tailnet effectively stands inside your network and can SSH into the target PC.
+
+建议措施：
+
+- 管理后台开启 **device approval**，新设备需手动批准
+- ACL 收敛到"只有我自己的设备可访问 22 端口"，其余设备只能访问必要服务
+- **不要**使用 node sharing 把跳板机共享给别人
+- 定期检查 tailnet 设备列表，移除不认识的机器
+- 目标 PC 上的免密登录只对跳板机开放（例如在 sshd 或防火墙层限制来源 IP）
+
+> 一句话：**你用便利换来的暴露面，要在同一处补上管控。** 子网路由不是"更安全的内网穿透"，它只是"把内网边界搬到了你的 tailnet 账号上"。
+
+### A.4 两个链路要分开排查 / The two paths are independent
+
+Tailscale 的可用性依赖其控制平面。如果跳板机与 Tailscale 服务失联，你不会丢掉开关机功能（那是巴法云 + 局域网内动作），但会丢掉"在外网访问局域网其他设备"的能力。两条链路是独立的，不要当成一回事来排查。
+
+The WOL/SSH path does not depend on Tailscale; only out-of-LAN access to other devices does. Diagnose them separately.
